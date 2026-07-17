@@ -1,9 +1,11 @@
 streamlit
 moviepy
-Pillow
 numpy
+Pillow
+gTTS
 imageio
 imageio-ffmpeg
-gTTS
 decorator
 proglog
+requests
+tqdm
