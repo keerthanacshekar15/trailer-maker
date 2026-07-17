@@ -1,11 +1,10 @@
 streamlit
 moviepy
-numpy
-Pillow
 gTTS
+Pillow
 imageio
 imageio-ffmpeg
-decorator
+numpy
 proglog
-requests
-tqdm
+decorator
+python-dotenv
