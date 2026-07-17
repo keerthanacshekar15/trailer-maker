@@ -1,0 +1,9 @@
+streamlit
+moviepy
+Pillow
+numpy
+imageio
+imageio-ffmpeg
+gTTS
+decorator
+proglog
