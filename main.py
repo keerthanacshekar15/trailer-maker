@@ -1,341 +1,819 @@
-"""
-AI Trailer Studio (MVP)
-------------------------
-A minimal but fully working Streamlit video editor:
-- Upload multiple videos
-- Trim clips and arrange them on a timeline
-- Add title cards / text overlays in multiple fonts
-- Apply effects (fade in, fade out, black & white, speed change)
-- AI voice narration (gTTS) + background music mixing
-- Export final MP4
-
-Run locally:  streamlit run main.py
-Deploy on Streamlit Community Cloud: push requirements.txt, packages.txt, main.py to a repo.
-"""
+# ==========================================================
+# AI Trailer Studio
+# Part 1 - Imports, Configuration & Session State
+# MoviePy 2.x Compatible
+# ==========================================================
 
 import os
-import time
-import tempfile
 import uuid
+import tempfile
+from pathlib import Path
 
-import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
+
 from gtts import gTTS
 
-from moviepy.editor import (
+from moviepy import (
     VideoFileClip,
-    ImageClip,
     AudioFileClip,
+    TextClip,
+    ColorClip,
     CompositeVideoClip,
     CompositeAudioClip,
     concatenate_videoclips,
 )
-from moviepy.video.fx.all import fadein, fadeout, blackwhite, speedx
-from moviepy.audio.fx.all import audio_loop, volumex
 
-# --------------------------------------------------------------------------------------
-# Config / constants
-# --------------------------------------------------------------------------------------
+# ----------------------------------------------------------
+# Streamlit Page Config
+# ----------------------------------------------------------
 
-st.set_page_config(page_title="AI Trailer Studio", page_icon="🎬", layout="wide")
-
-TARGET_HEIGHT = 480  # keep renders fast + reliable for a demo
-CANVAS_SIZE = (854, 480)
-
-FONT_OPTIONS = {
-    "Bold Sans": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "Serif Bold": "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
-    "Mono Bold": "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
-    "Sans Oblique": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
-}
-
-if "workdir" not in st.session_state:
-    st.session_state.workdir = tempfile.mkdtemp(prefix="trailer_")
-if "timeline" not in st.session_state:
-    st.session_state.timeline = []  # list of dicts: path, start, end, name
-if "uploaded_names" not in st.session_state:
-    st.session_state.uploaded_names = set()
-
-WORKDIR = st.session_state.workdir
-
-
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
-
-def get_font(font_path, size):
-    try:
-        return ImageFont.truetype(font_path, size)
-    except Exception:
-        return ImageFont.load_default()
-
-
-def wrap_text_size(draw, text, font):
-    bbox = draw.multiline_textbbox((0, 0), text, font=font, align="center")
-    return bbox[2] - bbox[0], bbox[3] - bbox[1], bbox[0], bbox[1]
-
-
-def make_title_image(text, font_path, fontsize, text_color, bg_color, size=CANVAS_SIZE):
-    img = Image.new("RGB", size, bg_color)
-    draw = ImageDraw.Draw(img)
-    font = get_font(font_path, fontsize)
-    w, h, ox, oy = wrap_text_size(draw, text, font)
-    x = (size[0] - w) // 2 - ox
-    y = (size[1] - h) // 2 - oy
-    draw.multiline_text((x, y), text, font=font, fill=text_color, align="center")
-    return np.array(img)
-
-
-def make_overlay_image(text, font_path, fontsize, text_color, position="bottom", size=CANVAS_SIZE):
-    img = Image.new("RGBA", size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    font = get_font(font_path, fontsize)
-    w, h, ox, oy = wrap_text_size(draw, text, font)
-    x = (size[0] - w) // 2 - ox
-    if position == "bottom":
-        y = size[1] - h - 40
-    elif position == "top":
-        y = 30
-    else:
-        y = (size[1] - h) // 2 - oy
-    # soft shadow for legibility over any footage
-    draw.multiline_text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 180), align="center")
-    draw.multiline_text((x, y), text, font=font, fill=text_color, align="center")
-    return np.array(img)
-
-
-def save_upload(uploaded_file):
-    path = os.path.join(WORKDIR, f"{uuid.uuid4().hex}_{uploaded_file.name}")
-    with open(path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    return path
-
-
-def load_clip_resized(path, start=None, end=None):
-    clip = VideoFileClip(path)
-    if start is not None and end is not None:
-        clip = clip.subclip(start, min(end, clip.duration))
-    if clip.h != TARGET_HEIGHT:
-        clip = clip.resize(height=TARGET_HEIGHT)
-    return clip
-
-
-# --------------------------------------------------------------------------------------
-# Sidebar - workflow steps
-# --------------------------------------------------------------------------------------
+st.set_page_config(
+    page_title="AI Trailer Studio",
+    page_icon="🎬",
+    layout="wide"
+)
 
 st.title("🎬 AI Trailer Studio")
-st.caption("Upload → Trim → Arrange → Titles → Effects → AI Narration → Export")
+st.caption("Create cinematic trailers directly inside Streamlit.")
 
-tabs = st.tabs(["1. Upload & Trim", "2. Timeline", "3. Titles & Text", "4. Effects", "5. Narration & Music", "6. Export"])
+# ----------------------------------------------------------
+# Temporary Working Directory
+# ----------------------------------------------------------
 
-# ---- Tab 1: Upload & Trim ----
-with tabs[0]:
-    st.subheader("Upload videos")
-    uploads = st.file_uploader(
-        "Upload one or more video clips",
-        type=["mp4", "mov", "avi", "mkv", "webm", "mpeg"],
-        accept_multiple_files=True,
+TEMP_DIR = Path(tempfile.gettempdir()) / "ai_trailer_studio"
+
+TEMP_DIR.mkdir(exist_ok=True)
+
+# ----------------------------------------------------------
+# Session State Initialization
+# ----------------------------------------------------------
+
+if "timeline" not in st.session_state:
+    st.session_state.timeline = []
+
+if "music_path" not in st.session_state:
+    st.session_state.music_path = None
+
+if "narration_path" not in st.session_state:
+    st.session_state.narration_path = None
+
+if "render_complete" not in st.session_state:
+    st.session_state.render_complete = False
+
+if "output_video" not in st.session_state:
+    st.session_state.output_video = None
+
+# ----------------------------------------------------------
+# Helper Functions
+# ----------------------------------------------------------
+
+def save_uploaded_file(uploaded_file):
+    """
+    Saves uploaded files into the temporary directory.
+
+    Returns
+    -------
+    str
+        Absolute path of saved file.
+    """
+
+    extension = Path(uploaded_file.name).suffix
+
+    filename = f"{uuid.uuid4()}{extension}"
+
+    destination = TEMP_DIR / filename
+
+    with open(destination, "wb") as file:
+        file.write(uploaded_file.getbuffer())
+
+    return str(destination)
+
+
+def get_clip_duration(video_path):
+    """
+    Returns video duration in seconds.
+    """
+
+    clip = VideoFileClip(video_path)
+
+    duration = clip.duration
+
+    clip.close()
+
+    return duration
+
+
+def reset_output():
+    """
+    Clears previous render.
+    """
+
+    st.session_state.render_complete = False
+    st.session_state.output_video = None
+
+
+# ----------------------------------------------------------
+# Sidebar
+# ----------------------------------------------------------
+
+st.sidebar.header("Project")
+
+if st.sidebar.button("🗑 Clear Timeline"):
+
+    st.session_state.timeline = []
+
+    reset_output()
+
+    st.sidebar.success("Timeline cleared.")
+
+st.sidebar.markdown("---")
+
+st.sidebar.write(
+    f"Clips in timeline: **{len(st.session_state.timeline)}**"
+)
+
+# ----------------------------------------------------------
+# Upload Section
+# ----------------------------------------------------------
+
+st.header("1️⃣ Upload Videos")
+
+uploaded_videos = st.file_uploader(
+    "Upload one or more video clips",
+    type=["mp4", "mov", "avi", "mkv"],
+    accept_multiple_files=True,
+)
+
+if uploaded_videos:
+
+    for uploaded in uploaded_videos:
+
+        file_path = save_uploaded_file(uploaded)
+
+        duration = get_clip_duration(file_path)
+
+        st.session_state.timeline.append(
+            {
+                "id": str(uuid.uuid4()),
+                "name": uploaded.name,
+                "path": file_path,
+                "start": 0.0,
+                "end": duration,
+                "duration": duration,
+            }
+        )
+
+    reset_output()
+
+    st.success(f"Added {len(uploaded_videos)} clip(s) to the timeline.")
+
+# ----------------------------------------------------------
+# Timeline Editor
+# ----------------------------------------------------------
+
+st.header("2️⃣ Timeline Editor")
+
+if not st.session_state.timeline:
+    st.info("Upload one or more videos to begin editing.")
+
+else:
+
+    delete_index = None
+    move_up_index = None
+    move_down_index = None
+
+    # Display every clip currently in the timeline
+    for index, clip in enumerate(st.session_state.timeline):
+
+        st.markdown("---")
+
+        col1, col2 = st.columns([2, 1])
+
+        # ----------------------------------------------
+        # Left Column
+        # ----------------------------------------------
+
+        with col1:
+
+            st.subheader(f"{index + 1}. {clip['name']}")
+
+            # Preview video
+            try:
+                st.video(clip["path"])
+            except Exception:
+                st.warning("Preview unavailable.")
+
+            # Trimming controls
+            start_time, end_time = st.slider(
+                "Trim Clip",
+                min_value=0.0,
+                max_value=float(clip["duration"]),
+                value=(
+                    float(clip["start"]),
+                    float(clip["end"]),
+                ),
+                step=0.1,
+                key=f"trim_{clip['id']}",
+            )
+
+            clip["start"] = start_time
+            clip["end"] = end_time
+
+            trimmed_duration = round(end_time - start_time, 2)
+
+            st.write(f"Trimmed Duration: **{trimmed_duration} sec**")
+
+        # ----------------------------------------------
+        # Right Column
+        # ----------------------------------------------
+
+        with col2:
+
+            st.write("### Actions")
+
+            if st.button(
+                "⬆ Move Up",
+                key=f"up_{clip['id']}",
+                disabled=index == 0,
+            ):
+                move_up_index = index
+
+            if st.button(
+                "⬇ Move Down",
+                key=f"down_{clip['id']}",
+                disabled=index == len(st.session_state.timeline) - 1,
+            ):
+                move_down_index = index
+
+            if st.button(
+                "❌ Delete",
+                key=f"delete_{clip['id']}",
+            ):
+                delete_index = index
+
+    # ----------------------------------------------
+    # Perform Move Up
+    # ----------------------------------------------
+
+    if move_up_index is not None:
+
+        timeline = st.session_state.timeline
+
+        timeline[move_up_index], timeline[move_up_index - 1] = (
+            timeline[move_up_index - 1],
+            timeline[move_up_index],
+        )
+
+        reset_output()
+
+        st.rerun()
+
+    # ----------------------------------------------
+    # Perform Move Down
+    # ----------------------------------------------
+
+    if move_down_index is not None:
+
+        timeline = st.session_state.timeline
+
+        timeline[move_down_index], timeline[move_down_index + 1] = (
+            timeline[move_down_index + 1],
+            timeline[move_down_index],
+        )
+
+        reset_output()
+
+        st.rerun()
+
+    # ----------------------------------------------
+    # Delete Clip
+    # ----------------------------------------------
+
+    if delete_index is not None:
+
+        st.session_state.timeline.pop(delete_index)
+
+        reset_output()
+
+        st.rerun()
+
+# ----------------------------------------------------------
+# Timeline Summary
+# ----------------------------------------------------------
+
+if st.session_state.timeline:
+
+    st.markdown("---")
+
+    total_duration = 0
+
+    for clip in st.session_state.timeline:
+        total_duration += clip["end"] - clip["start"]
+
+    st.success(
+        f"Timeline contains **{len(st.session_state.timeline)}** clip(s)"
     )
 
-    if uploads:
-        for uf in uploads:
-            key = f"{uf.name}_{uf.size}"
-            if key not in st.session_state.uploaded_names:
-                path = save_upload(uf)
-                st.session_state.uploaded_names.add(key)
-                st.session_state.setdefault("saved_paths", {})[key] = path
+    st.write(
+        f"Estimated trailer length: **{round(total_duration,2)} seconds**"
+    )
 
-    saved_paths = st.session_state.get("saved_paths", {})
-    for key, path in saved_paths.items():
-        with st.expander(f"🎞️ {os.path.basename(path)}", expanded=True):
-            try:
-                probe = VideoFileClip(path)
-                duration = probe.duration
-                st.video(path)
-                st.write(f"Duration: {duration:.1f}s | Resolution: {probe.w}x{probe.h} | FPS: {probe.fps:.1f}")
-                probe.close()
-            except Exception as e:
-                st.error(f"Could not read this file: {e}")
-                continue
+# ----------------------------------------------------------
+# 3️⃣ Title Screen
+# ----------------------------------------------------------
 
-            c1, c2 = st.columns(2)
-            start = c1.number_input(f"Start (s)", min_value=0.0, max_value=float(duration), value=0.0, key=f"start_{key}")
-            end = c2.number_input(f"End (s)", min_value=0.0, max_value=float(duration), value=float(duration), key=f"end_{key}")
+st.header("3️⃣ Title Screen")
 
-            if st.button("➕ Add trimmed clip to timeline", key=f"add_{key}"):
-                if end > start:
-                    st.session_state.timeline.append({
-                        "path": path,
-                        "start": start,
-                        "end": end,
-                        "name": os.path.basename(path),
-                        "id": uuid.uuid4().hex,
-                    })
-                    st.success("Added to timeline. Go to the 'Timeline' tab.")
-                else:
-                    st.warning("End time must be greater than start time.")
+enable_title = st.checkbox(
+    "Add title screen at beginning",
+    value=False
+)
 
-# ---- Tab 2: Timeline ----
-with tabs[1]:
-    st.subheader("Arrange your clips")
-    if not st.session_state.timeline:
-        st.info("No clips yet. Add some from the 'Upload & Trim' tab.")
-    for i, item in enumerate(st.session_state.timeline):
-        c1, c2, c3, c4 = st.columns([4, 1, 1, 1])
-        c1.write(f"**{i+1}. {item['name']}**  ({item['start']:.1f}s → {item['end']:.1f}s)")
-        if c2.button("⬆️", key=f"up_{item['id']}") and i > 0:
-            st.session_state.timeline[i - 1], st.session_state.timeline[i] = (
-                st.session_state.timeline[i],
-                st.session_state.timeline[i - 1],
-            )
-            st.rerun()
-        if c3.button("⬇️", key=f"down_{item['id']}") and i < len(st.session_state.timeline) - 1:
-            st.session_state.timeline[i + 1], st.session_state.timeline[i] = (
-                st.session_state.timeline[i],
-                st.session_state.timeline[i + 1],
-            )
-            st.rerun()
-        if c4.button("🗑️", key=f"del_{item['id']}"):
-            st.session_state.timeline.pop(i)
-            st.rerun()
+title_text = st.text_input(
+    "Main Title",
+    value="MY CINEMATIC TRAILER"
+)
 
-# ---- Tab 3: Titles & Text ----
-with tabs[2]:
-    st.subheader("Title card (intro)")
-    add_title = st.checkbox("Add an intro title card before the trailer", value=True)
-    title_text = st.text_input("Title text", value="THIS SUMMER")
-    title_font = st.selectbox("Title font", list(FONT_OPTIONS.keys()), key="title_font")
-    title_duration = st.slider("Title duration (s)", 1, 8, 3)
-    tc1, tc2 = st.columns(2)
-    title_color = tc1.color_picker("Text color", "#FFFFFF")
-    title_bg = tc2.color_picker("Background color", "#000000")
+subtitle_text = st.text_input(
+    "Subtitle",
+    value="Created with AI Trailer Studio"
+)
 
-    st.divider()
-    st.subheader("Caption overlay (over the whole trailer)")
-    add_overlay = st.checkbox("Add a text overlay across the trailer", value=False)
-    overlay_text = st.text_input("Overlay text", value="A JOURNEY BEYOND IMAGINATION")
-    overlay_font = st.selectbox("Overlay font", list(FONT_OPTIONS.keys()), key="overlay_font")
-    overlay_position = st.selectbox("Position", ["bottom", "center", "top"])
-    overlay_color = st.color_picker("Overlay text color", "#FFD700")
+title_duration = st.slider(
+    "Title Duration (seconds)",
+    min_value=1,
+    max_value=10,
+    value=3
+)
 
-# ---- Tab 4: Effects ----
-with tabs[3]:
-    st.subheader("Choose effects")
-    fx_fadein = st.checkbox("Fade in (start)", value=True)
-    fx_fadeout = st.checkbox("Fade out (end)", value=True)
-    fx_bw = st.checkbox("Black & white grade")
-    fx_speed = st.slider("Playback speed", 0.5, 2.0, 1.0, 0.1)
+# ----------------------------------------------------------
+# 4️⃣ Text Overlay
+# ----------------------------------------------------------
 
-# ---- Tab 5: Narration & Music ----
-with tabs[4]:
-    st.subheader("AI voice narration (text-to-speech)")
-    add_narration = st.checkbox("Generate AI narration")
-    narration_text = st.text_area("Narration script", value="In a world where anything is possible...")
-    narration_lang = st.selectbox("Language", ["en", "en-uk", "hi", "es", "fr"], index=0)
+st.header("4️⃣ Text Overlay")
 
-    st.divider()
-    st.subheader("Background music")
-    music_file = st.file_uploader("Upload background music (mp3/wav)", type=["mp3", "wav"])
-    music_volume = st.slider("Music volume", 0.0, 1.0, 0.3)
-    keep_original_audio = st.checkbox("Keep original video audio too", value=False)
+enable_overlay = st.checkbox(
+    "Enable text overlay",
+    value=False
+)
 
-# ---- Tab 6: Export ----
-with tabs[5]:
-    st.subheader("Render your trailer")
-    export_quality = st.selectbox("Export resolution", ["480p (fast)", "720p"])
-    render_btn = st.button("🎬 Render Trailer", type="primary")
+overlay_text = st.text_input(
+    "Overlay Text",
+    value=""
+)
 
-    if render_btn:
-        if not st.session_state.timeline:
-            st.error("Add at least one clip to the timeline first.")
+overlay_position = st.selectbox(
+    "Overlay Position",
+    [
+        "center",
+        "top",
+        "bottom",
+        "left",
+        "right",
+    ]
+)
+
+overlay_fontsize = st.slider(
+    "Overlay Font Size",
+    20,
+    90,
+    45
+)
+
+# ----------------------------------------------------------
+# Helper Function
+# ----------------------------------------------------------
+
+def convert_position(position):
+
+    positions = {
+        "center": ("center", "center"),
+        "top": ("center", "top"),
+        "bottom": ("center", "bottom"),
+        "left": ("left", "center"),
+        "right": ("right", "center"),
+    }
+
+    return positions[position]
+
+# ----------------------------------------------------------
+# 5️⃣ AI Narration
+# ----------------------------------------------------------
+
+st.header("5️⃣ AI Narration")
+
+enable_narration = st.checkbox(
+    "Generate AI Narration",
+    value=False
+)
+
+narration_text = st.text_area(
+    "Narration Script",
+    height=150,
+    placeholder="Enter narration..."
+)
+
+if enable_narration:
+
+    if st.button("Generate Narration"):
+
+        if narration_text.strip() == "":
+
+            st.error("Narration text cannot be empty.")
+
         else:
+
             try:
-                with st.spinner("Rendering... this can take a minute depending on clip length."):
-                    clips = []
 
-                    # 1. Title card
-                    if add_title and title_text.strip():
-                        title_img = make_title_image(
-                            title_text, FONT_OPTIONS[title_font], 60, title_color, title_bg
+                narration_file = TEMP_DIR / "narration.mp3"
+
+                tts = gTTS(
+                    text=narration_text,
+                    lang="en",
+                    slow=False
+                )
+
+                tts.save(str(narration_file))
+
+                st.session_state.narration_path = str(
+                    narration_file
+                )
+
+                st.success("Narration generated!")
+
+                st.audio(str(narration_file))
+
+            except Exception as error:
+
+                st.error(error)
+
+# ----------------------------------------------------------
+# 6️⃣ Background Music
+# ----------------------------------------------------------
+
+st.header("6️⃣ Background Music")
+
+music = st.file_uploader(
+    "Upload MP3/WAV Music",
+    type=["mp3", "wav"]
+)
+
+if music is not None:
+
+    try:
+
+        music_path = save_uploaded_file(music)
+
+        st.session_state.music_path = music_path
+
+        st.success("Music uploaded.")
+
+        st.audio(music_path)
+
+    except Exception as error:
+
+        st.error(error)
+
+# ----------------------------------------------------------
+# Asset Summary
+# ----------------------------------------------------------
+
+st.markdown("---")
+
+with st.expander("Current Project Assets", expanded=True):
+
+    st.write(
+        f"Title Screen: {'✅' if enable_title else '❌'}"
+    )
+
+    st.write(
+        f"Text Overlay: {'✅' if enable_overlay else '❌'}"
+    )
+
+    st.write(
+        f"Narration: {'✅' if st.session_state.narration_path else '❌'}"
+    )
+
+    st.write(
+        f"Background Music: {'✅' if st.session_state.music_path else '❌'}"
+    )
+
+# ----------------------------------------------------------
+# 7️⃣ Render Trailer
+# ----------------------------------------------------------
+
+st.header("7️⃣ Export Trailer")
+
+output_filename = st.text_input(
+    "Output File Name",
+    value="AI_Trailer.mp4"
+)
+
+render_button = st.button(
+    "🎬 Render Trailer",
+    type="primary",
+    use_container_width=True
+)
+
+# ----------------------------------------------------------
+# Rendering
+# ----------------------------------------------------------
+
+if render_button:
+
+    if len(st.session_state.timeline) == 0:
+
+        st.error("Please upload at least one video.")
+
+    else:
+
+        progress = st.progress(0)
+
+        status = st.empty()
+
+        clips = []
+
+        try:
+
+            # --------------------------------------
+            # Load timeline clips
+            # --------------------------------------
+
+            total = len(st.session_state.timeline)
+
+            for index, clip_info in enumerate(
+                st.session_state.timeline
+            ):
+
+                status.write(
+                    f"Loading clip {index+1}/{total}"
+                )
+
+                clip = VideoFileClip(
+                    clip_info["path"]
+                ).subclipped(
+                    clip_info["start"],
+                    clip_info["end"]
+                )
+
+                # ----------------------------------
+                # Optional Text Overlay
+                # ----------------------------------
+
+                if (
+                    enable_overlay
+                    and overlay_text.strip() != ""
+                ):
+
+                    txt = (
+                        TextClip(
+                            text=overlay_text,
+                            font_size=overlay_fontsize,
+                            color="white",
                         )
-                        title_clip = ImageClip(title_img).set_duration(title_duration)
-                        clips.append(title_clip)
-
-                    # 2. Timeline clips
-                    for item in st.session_state.timeline:
-                        clip = load_clip_resized(item["path"], item["start"], item["end"])
-                        clips.append(clip)
-
-                    main_clip = concatenate_videoclips(clips, method="compose")
-
-                    # 3. Effects
-                    if fx_speed != 1.0:
-                        main_clip = speedx(main_clip, factor=fx_speed)
-                    if fx_bw:
-                        main_clip = blackwhite(main_clip)
-                    if fx_fadein:
-                        main_clip = fadein(main_clip, 1)
-                    if fx_fadeout:
-                        main_clip = fadeout(main_clip, 1)
-
-                    # 4. Text overlay across whole trailer
-                    if add_overlay and overlay_text.strip():
-                        overlay_img = make_overlay_image(
-                            overlay_text, FONT_OPTIONS[overlay_font], 40, overlay_color, overlay_position
+                        .with_position(
+                            convert_position(
+                                overlay_position
+                            )
                         )
-                        overlay_clip = ImageClip(overlay_img).set_duration(main_clip.duration)
-                        main_clip = CompositeVideoClip([main_clip, overlay_clip])
-
-                    # 5. Audio: narration + music
-                    audio_tracks = []
-                    if keep_original_audio and main_clip.audio is not None:
-                        audio_tracks.append(main_clip.audio)
-
-                    narration_path = None
-                    if add_narration and narration_text.strip():
-                        narration_path = os.path.join(WORKDIR, f"narration_{uuid.uuid4().hex}.mp3")
-                        gTTS(text=narration_text, lang=narration_lang.split("-")[0]).save(narration_path)
-                        narration_audio = AudioFileClip(narration_path)
-                        audio_tracks.append(narration_audio)
-
-                    if music_file is not None:
-                        music_path = os.path.join(WORKDIR, f"music_{uuid.uuid4().hex}_{music_file.name}")
-                        with open(music_path, "wb") as f:
-                            f.write(music_file.getbuffer())
-                        bg_audio = AudioFileClip(music_path)
-                        if bg_audio.duration < main_clip.duration:
-                            bg_audio = audio_loop(bg_audio, duration=main_clip.duration)
-                        else:
-                            bg_audio = bg_audio.subclip(0, main_clip.duration)
-                        bg_audio = volumex(bg_audio, music_volume)
-                        audio_tracks.append(bg_audio)
-
-                    if audio_tracks:
-                        final_audio = CompositeAudioClip(audio_tracks).set_duration(main_clip.duration)
-                        main_clip = main_clip.set_audio(final_audio)
-
-                    # 6. Export
-                    out_path = os.path.join(WORKDIR, f"trailer_{uuid.uuid4().hex}.mp4")
-                    main_clip.write_videofile(
-                        out_path,
-                        fps=24,
-                        codec="libx264",
-                        audio_codec="aac",
-                        preset="ultrafast",
-                        threads=4,
-                        logger=None,
+                        .with_duration(
+                            clip.duration
+                        )
                     )
 
-                st.success("Trailer rendered!")
-                st.video(out_path)
-                with open(out_path, "rb") as f:
-                    st.download_button("⬇️ Download trailer (MP4)", f, file_name="trailer.mp4", mime="video/mp4")
+                    clip = CompositeVideoClip(
+                        [clip, txt]
+                    )
 
-            except Exception as e:
-                st.error(f"Render failed: {e}")
-                st.info("Try shorter clips, simpler effects, or fewer tracks and render again.")
+                clips.append(clip)
 
-st.divider()
-st.caption("AI Trailer Studio — MVP build. Uses gTTS for AI narration and DejaVu system fonts for titles/captions.")
+                progress.progress(
+                    int(
+                        ((index + 1) / total) * 40
+                    )
+                )
+
+            # --------------------------------------
+            # Concatenate clips
+            # --------------------------------------
+
+            status.write(
+                "Combining timeline..."
+            )
+
+            final_video = concatenate_videoclips(
+                clips,
+                method="compose"
+            )
+
+            progress.progress(55)
+
+            # --------------------------------------
+            # Optional Title Screen
+            # --------------------------------------
+
+            if enable_title:
+
+                status.write(
+                    "Creating title screen..."
+                )
+
+                background = ColorClip(
+                    size=final_video.size,
+                    color=(0, 0, 0),
+                    duration=title_duration,
+                )
+
+                title = (
+                    TextClip(
+                        text=title_text,
+                        font_size=70,
+                        color="white",
+                    )
+                    .with_position(("center", "center"))
+                    .with_duration(title_duration)
+                )
+
+                subtitle = (
+                    TextClip(
+                        text=subtitle_text,
+                        font_size=35,
+                        color="gray",
+                    )
+                    .with_position(
+                        ("center", "bottom")
+                    )
+                    .with_duration(title_duration)
+                )
+
+                title_clip = CompositeVideoClip(
+                    [
+                        background,
+                        title,
+                        subtitle,
+                    ]
+                )
+
+                final_video = concatenate_videoclips(
+                    [
+                        title_clip,
+                        final_video,
+                    ],
+                    method="compose",
+                )
+
+            progress.progress(70)
+
+            # --------------------------------------
+            # Optional AI Narration
+            # --------------------------------------
+
+            audio_layers = []
+
+            # Keep original video audio (if any)
+            if final_video.audio is not None:
+                audio_layers.append(final_video.audio)
+
+            if st.session_state.narration_path is not None:
+
+                status.write("Adding AI narration...")
+
+                narration_audio = AudioFileClip(
+                    st.session_state.narration_path
+                )
+
+                # Trim narration if longer than video
+                if narration_audio.duration > final_video.duration:
+                    narration_audio = narration_audio.subclipped(
+                        0,
+                        final_video.duration
+                    )
+
+                audio_layers.append(narration_audio)
+
+            progress.progress(80)
+
+            # --------------------------------------
+            # Optional Background Music
+            # --------------------------------------
+
+            if st.session_state.music_path is not None:
+
+                status.write("Adding background music...")
+
+                music = AudioFileClip(
+                    st.session_state.music_path
+                )
+
+                # Trim music to match trailer length
+                if music.duration > final_video.duration:
+
+                    music = music.subclipped(
+                        0,
+                        final_video.duration
+                    )
+
+                # Lower background music volume
+                # (MoviePy 2.x uses with_volume_scaled())
+                music = music.with_volume_scaled(0.25)
+
+                audio_layers.append(music)
+
+            # --------------------------------------
+            # Combine Audio
+            # --------------------------------------
+
+            if len(audio_layers) > 0:
+
+                status.write("Mixing audio...")
+
+                mixed_audio = CompositeAudioClip(
+                    audio_layers
+                )
+
+                final_video = final_video.with_audio(
+                    mixed_audio
+                )
+
+            progress.progress(90)
+
+            # --------------------------------------
+            # Output Path
+            # --------------------------------------
+
+            output_path = TEMP_DIR / output_filename
+
+            status.write("Rendering final trailer...")
+
+            final_video.write_videofile(
+                str(output_path),
+                codec="libx264",
+                audio_codec="aac",
+                fps=24,
+                logger=None,
+            )
+
+            progress.progress(100)
+
+            # --------------------------------------
+            # Cleanup MoviePy Objects
+            # --------------------------------------
+
+            final_video.close()
+
+            for clip in clips:
+                clip.close()
+
+            st.session_state.output_video = str(
+                output_path
+            )
+
+            st.session_state.render_complete = True
+
+            status.success(
+                "Trailer rendered successfully!"
+            )
+
+        except Exception as error:
+
+            st.error("Rendering failed.")
+
+            st.exception(error)
+
+# ----------------------------------------------------------
+# Download Section
+# ----------------------------------------------------------
+
+if (
+    st.session_state.render_complete
+    and st.session_state.output_video
+):
+
+    st.markdown("---")
+
+    st.header("8️⃣ Download")
+
+    st.video(st.session_state.output_video)
+
+    with open(
+        st.session_state.output_video,
+        "rb"
+    ) as video_file:
+
+        st.download_button(
+            label="⬇ Download Trailer",
+            data=video_file,
+            file_name=output_filename,
+            mime="video/mp4",
+            use_container_width=True,
+        )
+
+# ----------------------------------------------------------
+# Footer
+# ----------------------------------------------------------
+
+st.markdown("---")
+
+st.caption(
+    "AI Trailer Studio • Streamlit • MoviePy 2.x • gTTS"
+)
